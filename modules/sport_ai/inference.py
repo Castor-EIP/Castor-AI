@@ -12,8 +12,7 @@ SPORTS_BALL_CLASS_ID = 32
 BORDER_COLOR = (0, 0, 255)
 BORDER_THICKNESS = 6
 
-# Charger le modèle depuis le dossier du module
-MODEL_PATH = Path(__file__).parent / "models" / "yolov8n.pt"
+MODEL_PATH = (Path(__file__).resolve().parents[2] / "models" / "yolov8n.pt")
 
 def run(video_left: str, video_right: str, frameskip: int = 0):
     if not torch.cuda.is_available():
