@@ -1,7 +1,7 @@
 from __future__ import annotations
 
+import asyncio
 import logging
-from collections.abc import AsyncIterator
 
 import pytest
 
@@ -24,11 +24,6 @@ class FixedModule(AiModule):
 
     async def stop(self):
         self.stopped = True
-
-
-async def _stream(*messages) -> AsyncIterator:
-    for message in messages:
-        yield message
 
 
 @pytest.mark.asyncio
@@ -87,8 +82,15 @@ async def test_stream_sources_returns_scene_switch():
         None,
     )
 
-    messages = _stream(
-        ia_analysis_pb2.ClientMessage(
+    # FixedModule always returns a decision, so the analysis loop runs
+    # forever until told to stop - a StopSignal is required to end the
+    # stream, exactly like a real client would send one when done. The
+    # delay before the stop message gives the concurrent analysis loop a
+    # chance to run at least once, proving the server keeps reading the
+    # request stream (and can act on a later message) while analysis is
+    # in flight - the exact case that used to be blocked forever.
+    async def _messages():
+        yield ia_analysis_pb2.ClientMessage(
             session_id=start.session_id,
             sources=ia_analysis_pb2.SourceList(
                 sources=[
@@ -99,13 +101,21 @@ async def test_stream_sources_returns_scene_switch():
                 ]
             ),
         )
-    )
+        await asyncio.sleep(0.05)
+        yield ia_analysis_pb2.ClientMessage(
+            session_id=start.session_id,
+            stop=ia_analysis_pb2.StopSignal(reason="test done"),
+        )
 
-    events = [event async for event in service.AnalysisStream(messages, None)]
+    events = [event async for event in service.AnalysisStream(_messages(), None)]
 
-    assert len(events) == 1
-    assert events[0].event_type == ia_analysis_pb2.SERVER_EVENT_SWITCH_SUGGESTED
-    assert events[0].switch_suggestion.scene_id == "scene-1"
+    switch_events = [
+        e for e in events if e.event_type == ia_analysis_pb2.SERVER_EVENT_SWITCH_SUGGESTED
+    ]
+    assert switch_events, "expected at least one scene switch before the stop was processed"
+    assert switch_events[0].switch_suggestion.scene_id == "scene-1"
+    assert events[-1].event_type == ia_analysis_pb2.SERVER_EVENT_STATUS_CHANGED
+    assert events[-1].status.state == ia_analysis_pb2.SESSION_STATE_STOPPED
 
 
 @pytest.mark.asyncio
@@ -116,8 +126,8 @@ async def test_stream_sources_logs_flow_and_masks_source_values(caplog):
         None,
     )
 
-    messages = _stream(
-        ia_analysis_pb2.ClientMessage(
+    async def _messages():
+        yield ia_analysis_pb2.ClientMessage(
             session_id=start.session_id,
             sources=ia_analysis_pb2.SourceList(
                 sources=[
@@ -130,13 +140,20 @@ async def test_stream_sources_logs_flow_and_masks_source_values(caplog):
                 ]
             ),
         )
-    )
+        await asyncio.sleep(0.05)
+        yield ia_analysis_pb2.ClientMessage(
+            session_id=start.session_id,
+            stop=ia_analysis_pb2.StopSignal(reason="test done"),
+        )
 
     with caplog.at_level(logging.INFO, logger="castostudio_ai_server.service"):
-        events = [event async for event in service.AnalysisStream(messages, None)]
+        events = [event async for event in service.AnalysisStream(_messages(), None)]
 
     logs = caplog.text
-    assert len(events) == 1
+    switch_events = [
+        e for e in events if e.event_type == ia_analysis_pb2.SERVER_EVENT_SWITCH_SUGGESTED
+    ]
+    assert switch_events
     assert "AnalysisStream received" in logs
     assert "payload=sources" in logs
     assert "source_count=1" in logs

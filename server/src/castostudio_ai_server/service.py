@@ -106,71 +106,108 @@ class IaAnalysisService(ia_analysis_pb2_grpc.IaAnalysisServiceServicer):
         )
 
     async def AnalysisStream(self, request_iterator, context) -> AsyncIterator:
-        async for request in request_iterator:
-            payload = request.WhichOneof("payload")
-            LOGGER.info(
-                "AnalysisStream received session_id=%s payload=%s",
-                request.session_id or "<empty>",
-                payload or "<empty>",
-            )
-            session = self._sessions.get(request.session_id)
-            if session is None:
-                event = self._error_event(
-                    request.session_id,
-                    "SESSION_NOT_FOUND",
-                    "Session is unknown or already closed.",
-                    is_fatal=True,
-                )
-                self._log_server_event(event)
-                yield event
-                continue
+        # The client message reader and the analysis loop run as two
+        # concurrent tasks that both feed a shared queue, instead of the
+        # analysis loop being nested inside the message-reading loop. When
+        # nested, entering the analysis loop after the first SourceList
+        # blocked reading of the request stream until that loop ended (which
+        # for a module that keeps returning decisions, is never) - so no
+        # later SourceList update, KeepAlive, or StopSignal was ever seen.
+        # Sources went stale forever and StopSignal became unreachable
+        # dead code once analysis had started.
+        outgoing: asyncio.Queue = asyncio.Queue()
+        analysis_task: asyncio.Task | None = None
 
-            if payload == "sources":
-                session.sources = self._convert_sources(session, request.sources.sources)
+        async def read_client_messages() -> None:
+            nonlocal analysis_task
+            try:
+                async for request in request_iterator:
+                    payload = request.WhichOneof("payload")
+                    LOGGER.info(
+                        "AnalysisStream received session_id=%s payload=%s",
+                        request.session_id or "<empty>",
+                        payload or "<empty>",
+                    )
+                    session = self._sessions.get(request.session_id)
+                    if session is None:
+                        await outgoing.put(
+                            self._error_event(
+                                request.session_id,
+                                "SESSION_NOT_FOUND",
+                                "Session is unknown or already closed.",
+                                is_fatal=True,
+                            )
+                        )
+                        continue
 
-                event = self._status_event(
-                    session.context.session_id,
-                    ia_analysis_pb2.SESSION_STATE_READY,
-                    "Sources received. Continuous analysis started.",
-                )
-                self._log_server_event(event)
-                yield event
+                    if payload == "sources":
+                        session.sources = self._convert_sources(session, request.sources.sources)
+                        await outgoing.put(
+                            self._status_event(
+                                session.context.session_id,
+                                ia_analysis_pb2.SESSION_STATE_READY,
+                                "Sources received. Continuous analysis started.",
+                            )
+                        )
+                        if analysis_task is None:
+                            analysis_task = asyncio.create_task(
+                                self._run_analysis_loop(session, outgoing)
+                            )
+                    elif payload == "keep_alive":
+                        await outgoing.put(
+                            self._status_event(
+                                session.context.session_id,
+                                ia_analysis_pb2.SESSION_STATE_READY,
+                                "Session alive.",
+                            )
+                        )
+                    elif payload == "stop":
+                        LOGGER.info(
+                            "AnalysisStream stop requested session_id=%s reason=%s",
+                            session.context.session_id,
+                            request.stop.reason or "<empty>",
+                        )
+                        await self._stop_session(session.context.session_id)
+                        await outgoing.put(
+                            self._status_event(
+                                session.context.session_id,
+                                ia_analysis_pb2.SESSION_STATE_STOPPED,
+                                request.stop.reason or "Session stopped.",
+                            )
+                        )
+                        break
+                    else:
+                        await outgoing.put(
+                            self._error_event(
+                                request.session_id,
+                                "INVALID_ARGUMENT",
+                                "ClientMessage payload is required.",
+                                is_fatal=False,
+                            )
+                        )
+            finally:
+                await outgoing.put(None)  # sentinel: client stream done
 
-                async for event in self._analysis_loop(session):
-                    self._log_server_event(event)
-                    yield event
-            elif payload == "keep_alive":
-                event = self._status_event(
-                    session.context.session_id,
-                    ia_analysis_pb2.SESSION_STATE_READY,
-                    "Session alive.",
-                )
+        reader_task = asyncio.create_task(read_client_messages())
+
+        try:
+            while True:
+                event = await outgoing.get()
+                if event is None:
+                    break
                 self._log_server_event(event)
                 yield event
-            elif payload == "stop":
-                LOGGER.info(
-                    "AnalysisStream stop requested session_id=%s reason=%s",
-                    session.context.session_id,
-                    request.stop.reason or "<empty>",
-                )
-                await self._stop_session(session.context.session_id)
-                event = self._status_event(
-                    session.context.session_id,
-                    ia_analysis_pb2.SESSION_STATE_STOPPED,
-                    request.stop.reason or "Session stopped.",
-                )
-                self._log_server_event(event)
-                yield event
-                break
-            else:
-                event = self._error_event(
-                    request.session_id,
-                    "INVALID_ARGUMENT",
-                    "ClientMessage payload is required.",
-                    is_fatal=False,
-                )
-                self._log_server_event(event)
-                yield event
+        finally:
+            reader_task.cancel()
+            if analysis_task is not None:
+                analysis_task.cancel()
+            for task in (reader_task, analysis_task):
+                if task is None:
+                    continue
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
 
     async def EndSession(self, request, context):
         LOGGER.info("EndSession received session_id=%s", request.session_id or "<empty>")
@@ -218,10 +255,10 @@ class IaAnalysisService(ia_analysis_pb2_grpc.IaAnalysisServiceServicer):
         ]
 
 
-    async def _analysis_loop(self, session: _Session) -> AsyncIterator:
-        if session.sources is None:
-            return
-
+    async def _run_analysis_loop(self, session: _Session, outgoing: asyncio.Queue) -> None:
+        """Runs concurrently with read_client_messages(); session.sources is
+        shared mutable state, so updates from a later SourceList are picked
+        up on the next iteration without needing to stop this loop."""
         while session.context.session_id in self._sessions:
             try:
                 decision = await session.module.analyze_sources(session.sources)
@@ -231,11 +268,13 @@ class IaAnalysisService(ia_analysis_pb2_grpc.IaAnalysisServiceServicer):
                     "Analysis failed session_id=%s error_code=ANALYSIS_FAILED",
                     session.context.session_id,
                 )
-                yield self._error_event(
-                    session.context.session_id,
-                    "ANALYSIS_FAILED",
-                    f"AI module failed during analysis: {exc}",
-                    is_fatal=False,
+                await outgoing.put(
+                    self._error_event(
+                        session.context.session_id,
+                        "ANALYSIS_FAILED",
+                        f"AI module failed during analysis: {exc}",
+                        is_fatal=False,
+                    )
                 )
                 return
 
@@ -247,14 +286,16 @@ class IaAnalysisService(ia_analysis_pb2_grpc.IaAnalysisServiceServicer):
                     decision.confidence,
                 )
 
-                yield ia_analysis_pb2.ServerEvent(
-                    session_id=session.context.session_id,
-                    timestamp_ms=self._now_ms(),
-                    event_type=ia_analysis_pb2.SERVER_EVENT_SWITCH_SUGGESTED,
-                    switch_suggestion=ia_analysis_pb2.SceneSwitch(
-                        scene_id=decision.scene_id,
-                        confidence=decision.confidence,
-                    ),
+                await outgoing.put(
+                    ia_analysis_pb2.ServerEvent(
+                        session_id=session.context.session_id,
+                        timestamp_ms=self._now_ms(),
+                        event_type=ia_analysis_pb2.SERVER_EVENT_SWITCH_SUGGESTED,
+                        switch_suggestion=ia_analysis_pb2.SceneSwitch(
+                            scene_id=decision.scene_id,
+                            confidence=decision.confidence,
+                        ),
+                    )
                 )
 
             await asyncio.sleep(0.1)
