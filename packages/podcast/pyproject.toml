@@ -7,7 +7,8 @@ dependencies = [
   "castostudio-ai-core>=0.1.0",
   "av>=18.0.0",
   "numpy",
-  "ultralytics>=8.3.228"
+  "torch>=2.0.0",
+  "silero-vad>=5.1.2"
 ]
 
 [project.entry-points."castostudio_ai.modules"]
