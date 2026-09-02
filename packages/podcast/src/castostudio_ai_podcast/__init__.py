@@ -2,126 +2,69 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import threading
 import time
 from collections.abc import Sequence
 
-import cv2
-import torch
 from castostudio_ai_core import AiModule, SceneDecision, SessionContext, Source
-from ultralytics import YOLO
 
-from .audio import AudioVolumeReader
+from .audio import AudioStreamReader
+from .vad import SpeechModel
 
 LOGGER = logging.getLogger(__name__)
 
-class WideCameraViewer:
-    def __init__(self, url: str, model: YOLO, device: str):
-        self.url = url
-        self.model = model
-        self.device = device
-        self.running = False
-        self.thread = None
-        self.people_count = 0
-        self.lock = threading.Lock()
-
-    def start(self):
-        self.running = True
-        self.thread = threading.Thread(target=self._run, name="WideViewer", daemon=True)
-        self.thread.start()
-        LOGGER.info("Wide camera viewer thread started for %s", self.url)
-
-    def stop(self):
-        self.running = False
-        if self.thread is not None:
-            self.thread.join(timeout=1.0)
-            self.thread = None
-        LOGGER.info("Wide camera viewer thread stopped")
-
-    def get_people_count(self) -> int:
-        with self.lock:
-            return self.people_count
-
-    def _run(self):
-        cap = cv2.VideoCapture(self.url)
-        if not cap.isOpened():
-            LOGGER.warning("Could not open wide camera stream: %s", self.url)
-            return
-        cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-        
-        while self.running:
-            try:
-                ret, frame = cap.read()
-                if not ret or frame is None:
-                    time.sleep(0.5)
-                    continue
-                
-                # Predict persons (class 0)
-                results = self.model.predict(
-                    frame,
-                    conf=0.3,
-                    classes=[0],
-                    device=self.device,
-                    verbose=False
-                )[0]
-                
-                count = len(results.boxes)
-                with self.lock:
-                    self.people_count = count
-            except Exception as exc:
-                LOGGER.warning("YOLO detection error: %s", exc)
-                time.sleep(1)
-            time.sleep(1.0)
-        cap.release()
+AUDIO_ROLES = ("host", "guest", "host_zoom", "guest_zoom")
 
 
 class PodcastModule(AiModule):
     def __init__(self) -> None:
-        self._audio_readers: dict[str, AudioVolumeReader] = {}
-        self._wide_viewer: WideCameraViewer | None = None
-        self._yolo_model: YOLO | None = None
-        self._device = "cpu"
-        
+        self._audio_readers: dict[str, AudioStreamReader] = {}
+
         # Configuration
-        self._db_threshold = -40.0
         self._min_hold_time = 3.0
         self._monologue_time = 5.0
-        
+        self._vad_threshold = 0.5
+        self._min_silence_duration_ms = 400
+        self._speech_pad_ms = 100
+
+        # Role cache: recomputed only when the (scene_id, label) set changes,
+        # so source-list reordering between cycles can't flip role assignment
+        # and force audio readers to reconnect for no reason. Label is part
+        # of the fingerprint so a scene_id that gets relabeled (camera swap
+        # behind a stable id) still re-resolves its role.
+        self._role_cache: dict[str, str] = {}
+        self._roles_fingerprint: frozenset[tuple[str, str]] = frozenset()
+
         # State machine
         self._current_scene_id: str | None = None
         self._last_switch_time = 0.0
         self._speaker_active_since: dict[str, float] = {}
         self._last_active_speaker: str | None = None
         self._silence_start_time: float | None = None
+        self._last_diag_log_time = 0.0
 
     async def start(self, context: SessionContext) -> None:
-        # Load configuration
-        self._db_threshold = float(context.config.get("db_threshold", -40.0))
+        # Configuration
         self._min_hold_time = float(context.config.get("min_hold_time", 3.0))
         self._monologue_time = float(context.config.get("monologue_time", 5.0))
-        
-        LOGGER.info("[PodcastModule] config: db_threshold=%.1f min_hold_time=%.1f monologue_time=%.1f",
-                    self._db_threshold, self._min_hold_time, self._monologue_time)
+        self._vad_threshold = float(context.config.get("vad_threshold", 0.5))
+        self._min_silence_duration_ms = int(
+            context.config.get("min_silence_duration_ms", 400)
+        )
+        self._speech_pad_ms = int(context.config.get("speech_pad_ms", 100))
 
-        # Load YOLO26 model with GPU acceleration in a separate thread to prevent blocking the server
-        await asyncio.to_thread(self._initialize_yolo)
+        LOGGER.info(
+            "[PodcastModule] config: min_hold_time=%.1f monologue_time=%.1f "
+            "vad_threshold=%.2f min_silence_duration_ms=%d speech_pad_ms=%d",
+            self._min_hold_time,
+            self._monologue_time,
+            self._vad_threshold,
+            self._min_silence_duration_ms,
+            self._speech_pad_ms,
+        )
 
-    def _initialize_yolo(self):
-        try:
-            if torch.backends.mps.is_available():
-                self._device = "mps"
-            elif torch.cuda.is_available():
-                self._device = "cuda"
-            else:
-                self._device = "cpu"
-            
-            LOGGER.info("[PodcastModule] Loading YOLO model on device: %s", self._device)
-            # Load the yolov8n.pt model (Ultralytics auto-downloads it if not present)
-            self._yolo_model = YOLO("yolov8n.pt")
-            LOGGER.info("[PodcastModule] YOLO loaded successfully")
-        except Exception as exc:
-            LOGGER.warning("[PodcastModule] Could not load YOLO model, falling back to audio-only. Error: %s", exc)
-            self._yolo_model = None
+        # Load the VAD model now, off the event loop, so the first analysis
+        # cycle isn't blocked by a cold model load.
+        await asyncio.to_thread(SpeechModel.get)
 
     async def analyze_sources(self, sources: Sequence[Source]) -> SceneDecision | None:
         if not sources:
@@ -132,51 +75,54 @@ class PodcastModule(AiModule):
 
     def _analyze_sync(self, sources: Sequence[Source]) -> SceneDecision | None:
         now = time.monotonic()
-        
-        # 1. Parse camera roles
-        roles = self._parse_roles(sources)
-        
+
+        # 1. Resolve camera roles (cached; see _get_roles)
+        roles = self._get_roles(sources)
+
         # 2. Manage audio reader threads
         self._update_audio_readers(sources, roles)
-        
-        # 3. Manage wide camera YOLO viewer
-        self._update_wide_viewer_with_sources(sources, roles)
 
-        # 4. Get active speakers based on volume or metadata
+        # 3. Get active speakers: client-sent metadata first, VAD fallback
         active_speakers = []
         volumes = {}
-        
+
         for role, reader in self._audio_readers.items():
-            # Find the corresponding source for this role to check metadata
             scene_id = roles.get(role)
             source = next((s for s in sources if s.scene_id == scene_id), None)
-            
-            # Check metadata first (bypass if client sends speaking status)
+
             is_speaking_meta = False
             if source and source.metadata:
                 is_speaking_str = source.metadata.get("is_speaking", "").lower()
                 active_speaker_str = source.metadata.get("active_speaker", "").lower()
                 if is_speaking_str == "true" or active_speaker_str == "true":
                     is_speaking_meta = True
-            
-            if is_speaking_meta:
+
+            volumes[role] = reader.get_volume_db()
+
+            if is_speaking_meta or reader.is_speaking():
                 active_speakers.append(role)
-                volumes[role] = 0.0 # Virtual active volume
-            else:
-                # Fallback to audio reader RMS
-                db = reader.get_volume_db()
-                volumes[role] = db
-                if db >= self._db_threshold:
-                    active_speakers.append(role)
 
-        LOGGER.debug("[PodcastModule] Active speakers: %s, Volumes: %s", active_speakers, volumes)
-
-        # 5. Anti-flicker guard
-        if self._current_scene_id is not None and (now - self._last_switch_time < self._min_hold_time):
-            return None
-
-        # 6. State Machine logic to select the target role
+        # 4. State machine ticks every cycle, even while a switch is being
+        # held back below. It must see every cycle to keep its internal
+        # timers (silence duration, monologue duration) accurate — skipping
+        # ticks during the hold window used to freeze that clock, so the
+        # decision made right as the hold expired was driven by whatever
+        # single noisy sample happened to land at that instant instead of
+        # the real sustained state.
         target_role = self._run_state_machine(active_speakers, roles, now)
+
+        if now - self._last_diag_log_time >= 1.0:
+            self._last_diag_log_time = now
+            LOGGER.info(
+                "[PodcastModule] diag: active_speakers=%s volumes=%s state_machine_target=%s "
+                "current_scene=%s hold_remaining=%.1f",
+                active_speakers,
+                {role: round(db, 1) for role, db in volumes.items()},
+                target_role,
+                self._current_scene_id,
+                max(0.0, self._min_hold_time - (now - self._last_switch_time)),
+            )
+
         if target_role is None:
             return None
 
@@ -189,11 +135,26 @@ class PodcastModule(AiModule):
         if target_scene_id == self._current_scene_id:
             return None
 
+        # 5. Anti-flicker guard: gate emitting the switch, not tracking it.
+        if self._current_scene_id is not None and (now - self._last_switch_time < self._min_hold_time):
+            return None
+
         self._current_scene_id = target_scene_id
         self._last_switch_time = now
-        LOGGER.info("[PodcastModule] Decision: Switch to role '%s' (scene_id='%s')", target_role, target_scene_id)
-        
+        LOGGER.info(
+            "[PodcastModule] Decision: Switch to role '%s' (scene_id='%s')",
+            target_role,
+            target_scene_id,
+        )
+
         return SceneDecision(scene_id=target_scene_id, confidence=0.9)
+
+    def _get_roles(self, sources: Sequence[Source]) -> dict[str, str]:
+        fingerprint = frozenset((source.scene_id, source.label) for source in sources)
+        if fingerprint != self._roles_fingerprint:
+            self._role_cache = self._parse_roles(sources)
+            self._roles_fingerprint = fingerprint
+        return self._role_cache
 
     def _parse_roles(self, sources: Sequence[Source]) -> dict[str, str]:
         """Map roles (host, guest, wide, host_zoom, guest_zoom) to scene_ids."""
@@ -237,7 +198,7 @@ class PodcastModule(AiModule):
 
         # 4. Fallback based on indices for remaining roles
         unmatched = [s for s in sources if s.scene_id not in matched_sources]
-        
+
         if "wide" not in roles and unmatched:
             if len(sources) >= 3:
                 roles["wide"] = sources[2].scene_id
@@ -269,44 +230,30 @@ class PodcastModule(AiModule):
     def _update_audio_readers(self, sources: Sequence[Source], roles: dict[str, str]):
         active_role_urls = {}
         for role, scene_id in roles.items():
-            if role in ["host", "guest", "host_zoom", "guest_zoom"]:
+            if role in AUDIO_ROLES:
                 source = next((s for s in sources if s.scene_id == scene_id), None)
                 if source:
                     active_role_urls[role] = source.url
 
-        # Remove readers that are no longer active
+        # Remove readers that are no longer active, or whose URL changed
         for role in list(self._audio_readers.keys()):
-            if role not in active_role_urls:
+            target_url = active_role_urls.get(role)
+            if target_url is None or self._audio_readers[role].url != target_url:
                 self._audio_readers[role].stop()
                 del self._audio_readers[role]
 
         # Start new readers
         for role, url in active_role_urls.items():
             if role not in self._audio_readers:
-                reader = AudioVolumeReader(url, role)
+                reader = AudioStreamReader(
+                    url,
+                    role,
+                    vad_threshold=self._vad_threshold,
+                    min_silence_duration_ms=self._min_silence_duration_ms,
+                    speech_pad_ms=self._speech_pad_ms,
+                )
                 reader.start()
                 self._audio_readers[role] = reader
-
-    def _update_wide_viewer_with_sources(self, sources: Sequence[Source], roles: dict[str, str]):
-        wide_scene_id = roles.get("wide")
-        if wide_scene_id is None or self._yolo_model is None:
-            if self._wide_viewer:
-                self._wide_viewer.stop()
-                self._wide_viewer = None
-            return
-
-        source = next((s for s in sources if s.scene_id == wide_scene_id), None)
-        if not source:
-            if self._wide_viewer:
-                self._wide_viewer.stop()
-                self._wide_viewer = None
-            return
-
-        if self._wide_viewer is None or self._wide_viewer.url != source.url:
-            if self._wide_viewer:
-                self._wide_viewer.stop()
-            self._wide_viewer = WideCameraViewer(source.url, self._yolo_model, self._device)
-            self._wide_viewer.start()
 
     def _run_state_machine(self, active_speakers: list[str], roles: dict[str, str], now: float) -> str | None:
         normalized_speakers = []
@@ -321,12 +268,12 @@ class PodcastModule(AiModule):
         if not normalized_speakers:
             if self._silence_start_time is None:
                 self._silence_start_time = now
-            
+
             if now - self._silence_start_time >= 3.0:
                 self._speaker_active_since.clear()
                 self._last_active_speaker = None
                 return "wide"
-            
+
             return None
 
         self._silence_start_time = None
@@ -339,16 +286,16 @@ class PodcastModule(AiModule):
 
         # Case 3: Single active speaker
         speaker = normalized_speakers[0]
-        
+
         if speaker != self._last_active_speaker:
             self._speaker_active_since.clear()
             self._speaker_active_since[speaker] = now
             self._last_active_speaker = speaker
 
         active_duration = now - self._speaker_active_since.get(speaker, now)
-        
+
         has_zoom = f"{speaker}_zoom" in roles
-        
+
         if has_zoom and active_duration >= self._monologue_time:
             return f"{speaker}_zoom"
         else:
@@ -360,9 +307,4 @@ class PodcastModule(AiModule):
             await asyncio.to_thread(reader.stop)
         self._audio_readers.clear()
 
-        if self._wide_viewer:
-            await asyncio.to_thread(self._wide_viewer.stop)
-            self._wide_viewer = None
-        
-        self._yolo_model = None
         LOGGER.info("[PodcastModule] Stopped and cleaned resources")

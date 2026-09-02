@@ -369,13 +369,29 @@ default_confidence=0.8
 
 ### podcast
 
-Selects the first source where:
+Maps sources to roles (`host`, `guest`, `host_zoom`, `guest_zoom`, `wide`) from `label`
+keywords (FR/EN), then runs a state machine driven by real speech detection
+(Silero VAD) per role, with `metadata["is_speaking"]` / `metadata["active_speaker"]`
+as a client-provided override when present:
+
+- Silence on all roles for 3s -> `wide`.
+- Two roles speaking at once (debate/cross-talk) -> `wide`.
+- One role speaking -> that role's camera; after `monologue_time` seconds
+  continuously on the same speaker, switches to that speaker's `_zoom` role
+  if one exists.
+- Switches are held for at least `min_hold_time` seconds to avoid flicker.
+
+VAD runs on GPU/MPS when available, CPU otherwise (device auto-detected).
+
+Optional config:
 
 ```text
-metadata["active_speaker"] == "true"
+min_hold_time=3.0            # seconds a scene is held before switching again
+monologue_time=5.0           # seconds before zooming in on a sustained speaker
+vad_threshold=0.5            # Silero speech probability threshold (0-1)
+min_silence_duration_ms=400  # silence needed before a speaker is considered done talking
+speech_pad_ms=100            # padding kept around detected speech segments
 ```
-
-Falls back to the first source.
 
 ## Development Notes
 
